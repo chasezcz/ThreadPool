@@ -2,88 +2,131 @@
 ThreadPool class, which supports run tasks with timeout.
 """
 
+import ctypes
+import logging
 import threading
 import time
-import logging
-from queue import Queue, LifoQueue
+from queue import Queue
 from threading import Thread
-from typing import Dict, Tuple
-
 
 # get threadpool logger
 logger = logging.getLogger("threadpool")
-
 
 class ThreadPool:
     """
     ThreadPool class, which supports run tasks with timeout.
     """
 
-    # TODO: 每个 worker 的 task 完成时，不能立即删除，而是等待一段时间，如果没有新的 task 加入，则删除该 worker。
-
     def __init__(
         self,
         num_workers: int = 1,
         timeout: float = 0,
         name_prefix: str = "Thread",
-        shutdown: bool = False,
+        enable_shutdown: bool = False,
     ) -> None:
-        self._num_workers = num_workers
-        self._timeout = timeout
-        self._name_prefix = name_prefix
-        self._pool: Dict[Thread, Tuple] = {}
+        self.num_workers = num_workers
+        self.timeout = timeout
+        self.name_prefix = name_prefix
 
-        self._tasks = LifoQueue()
-        self._shutdown = shutdown
-        Thread(target=self._watch, daemon=True, name="pool_watcher").start()
+        self.pool = []
+        self.active_num = 0
+        self.tasks = Queue()
+        self.enable_shutdown = enable_shutdown
+        self.water_thread = Thread(target=self.watch, daemon=True, name="pool_watcher")
+        self.water_thread.start()
 
-    def _watch(self):
-        while True:
-            # Check whether thread execution times out or ends.
-            for thread in list(self._pool.keys()):
-                start_time, timeout = self._pool[thread]
-                if not thread.is_alive():
-                    self._pool.pop(thread)
-                elif 0 < timeout < time.time() - start_time:
-                    if self._shutdown:
-                        # !!!!! Forcibly stop the thread, but this operation may cause the spark server to crash !!!!
-                        import ctypes
-
-                        if thread.ident is not None:
-                            try:
-                                ctypes.pythonapi.PyThreadState_SetAsyncExc(
-                                    ctypes.c_long(thread.ident), ctypes.py_object(SystemExit)
-                                )
-                            except Exception:
-                                ...
-                    self._pool.pop(thread)
-                    logger.info(f"thread-{thread.name} time out. drop it.")
-
-            # Add a new task when the size of thread_pool is lower than num_workers.
-            if not self._tasks.empty() and len(self._pool) < self._num_workers:
-                # If this thread has no task and there are tasks in the task pool that are not executed.
-                func, task_name, timeout, args, kwargs = self._tasks.get()
-                name = f"{self._name_prefix}_{task_name}"
-                timeout = timeout if timeout != 0.0 else self._timeout
-                thread = Thread(target=func, args=args, kwargs=kwargs, name=name, daemon=True)
-                self._pool[thread] = (time.time(), timeout)
-                thread.start()
-
-    def submit_with_timeout(self, func, task_name: str = "", timeout: float = 0.0, *args, **kwargs) -> None:
+    def new_worker_thread(self, id: int):
         """
-        run a task with timeout.
+        _summary_: create a new thread.
 
         Args:
-            func: target function.
-            task_name: task_name.
-            timeout: function timeout.
-            *args:  function args.
-            **kwargs: function kwargs.
+            id (int): create a new thread and add it to the thread pool.
+        """
+        while id >= len(self.pool):
+            self.pool.append({})
+
+        thread = Thread(target=self.worker_watch, args=(id,), daemon=True)
+        self.pool[id] = {"thread": thread}
+        thread.start()
+
+    def kill_thread(self, thread_ident):
+        if thread_ident is not None:
+            try:
+                ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(thread_ident), ctypes.py_object(SystemExit))
+            except Exception:
+                ...
+
+    def kill_worker_thread(self, id: int):
+        """
+        _summary_: kill a thread.
+
+        Args:
+            id (int): the index of thread pool.
+        """
+        if id < len(self.pool) and "thread" in self.pool[id]:
+            thread = self.pool[id]["thread"]
+            self.kill_thread(thread.ident)
+
+            self.pool[id].pop("thread")
+            self.pool[id].pop("start_time")
+            del thread
+
+
+    def watch(self):
+        """
+        _summary_: watch thread pool, if thread is timeout, kill it and create a new thread.
         """
 
-        self._tasks.put([func, task_name, timeout, args, kwargs])
+        while True:
+            active_num = 0
+            # Check whether thread execution times out or ends.
+            for id in range(self.num_workers):
+                # If the thread is not in the thread pool, create a new thread.
+                if id >= len(self.pool):
+                    self.new_worker_thread(id)
+                # Check if the thread is timeout, create a new thread.
+                thread_item: dict = self.pool[id]
+                if "thread" not in thread_item:
+                    self.new_worker_thread(id)
+                # 判断线程执行时间是否超时
+                if self.enable_shutdown and "start_time" in thread_item and "timeout" in thread_item:
+                    if time.time() - thread_item["start_time"] > thread_item["timeout"]:
+                        thread_name = thread_item["thread"].name
+                        logger.debug(f"{thread_name} execute timeout, kill it.")
+                        self.kill_worker_thread(id)
+                        self.new_worker_thread(id)
+                # 判断线程是否存活
+                if "thread" in thread_item and "start_time" in thread_item:
+                    active_num += 1
 
-    def submit(self, func, task_name: str = "", *args, **kwargs) -> None:
+            self.active_num = active_num
+            time.sleep(0.1)
+
+    def worker_watch(self, id: int):
+        """
+        _summary_: worker thread, run task.
+
+        Args:
+            id (int): the index of thread pool.
+        """
+        while True:
+            threading.current_thread().name = f"{self.name_prefix}_{id}"
+
+            func, task_name, timeout, args, kwargs = self.tasks.get(True)
+            timeout = timeout if timeout != 0.0 else self.timeout
+
+            threading.current_thread().name = f"{self.name_prefix}_{id}_{task_name}"
+            try:
+                self.pool[id].update({"start_time": time.time(), "timeout": timeout})
+                func(*args, **kwargs)
+                logger.debug(f"{self.name_prefix}_{id}_{task_name} done.")
+            except Exception as e:
+                logger.error(f"{self.name_prefix}_{id}_{task_name} error: {e}")
+            finally:
+                self.pool[id].pop("start_time", "")
+                self.pool[id].pop("timeout", "")
+
+    def submit(self, func, task_name: str = "", time: int = 0, *args, **kwargs) -> None:
         """
         run a task without timeout.
 
@@ -93,7 +136,7 @@ class ThreadPool:
             *args:  function args.
             **kwargs: function kwargs.
         """
-        self._tasks.put([func, task_name, self._timeout, args, kwargs])
+        self.tasks.put([func, task_name, time, args, kwargs])
 
     @property
     def size(self) -> int:
@@ -103,7 +146,8 @@ class ThreadPool:
         Returns:
             int: the count.
         """
-        return len(self._pool)
+
+        return self.active_num
 
     @property
     def empty(self) -> bool:
@@ -113,7 +157,7 @@ class ThreadPool:
         Returns:
             bool: the result of whether all the thread tasks are done.
         """
-        return len(self._pool) == 0 and self._tasks.empty()
+        return self.active_num == 0 and self.tasks.empty()
 
     @property
     def names(self) -> list:
@@ -121,11 +165,34 @@ class ThreadPool:
         return names of cur pool.
         """
         names = []
-        for thread in self._pool:
+        for thread in self.pool:
             names.append(thread.name)
         return names
 
     def shutdown(self):
-        """ shutdown the thread pool. """
-        self._pool.clear()
-        self._tasks = Queue()
+        """shutdown the thread pool."""
+        logger.debug("shutdown thread pool.")
+        for id, _ in enumerate(self.pool):
+            self.kill_worker_thread(id)
+        self.pool.clear()
+        self.tasks = Queue()
+        logger.debug("shutdown water thread.")
+        self.kill_worker_thread(self.water_thread.ident)
+        logger.debug("thread pool shutdown done.")
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(message)s")
+
+    pool = ThreadPool(num_workers=3, timeout=0 , enable_shutdown=True, name_prefix="test")
+
+    def sleep_and_print(t):
+        time.sleep(t)
+        logger.info(f"print {t}")
+
+    pool.submit(sleep_and_print, "sleep_and_print", 1, 3)
+    pool.submit(sleep_and_print, "sleep_and_print", 2, 3)
+    pool.submit(sleep_and_print, "sleep_and_print", 3, 3)
+    pool.submit(sleep_and_print, "sleep_and_print", 4, 3)
+    while True:
+        ...
