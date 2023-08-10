@@ -12,6 +12,7 @@ from threading import Thread
 # get threadpool logger
 logger = logging.getLogger("threadpool")
 
+
 class ThreadPool:
     """
     ThreadPool class, which supports run tasks with timeout.
@@ -67,17 +68,16 @@ class ThreadPool:
             thread = self.pool[id]["thread"]
             self.kill_thread(thread.ident)
 
-            self.pool[id].pop("thread")
-            self.pool[id].pop("start_time")
+            self.pool[id].pop("thread", "")
+            self.pool[id].pop("start_time", "")
             del thread
-
 
     def watch(self):
         """
         _summary_: watch thread pool, if thread is timeout, kill it and create a new thread.
         """
 
-        while True:
+        while True and self.tasks is not None:
             active_num = 0
             # Check whether thread execution times out or ends.
             for id in range(self.num_workers):
@@ -109,7 +109,7 @@ class ThreadPool:
         Args:
             id (int): the index of thread pool.
         """
-        while True:
+        while True and self.tasks is not None:
             threading.current_thread().name = f"{self.name_prefix}_{id}"
 
             func, task_name, timeout, args, kwargs = self.tasks.get(True)
@@ -136,6 +136,8 @@ class ThreadPool:
             *args:  function args.
             **kwargs: function kwargs.
         """
+        if self.tasks is None:
+            return
         self.tasks.put([func, task_name, time, args, kwargs])
 
     @property
@@ -157,7 +159,7 @@ class ThreadPool:
         Returns:
             bool: the result of whether all the thread tasks are done.
         """
-        return self.active_num == 0 and self.tasks.empty()
+        return self.active_num == 0 and (self.tasks is None or self.tasks.empty())
 
     @property
     def names(self) -> list:
@@ -171,20 +173,18 @@ class ThreadPool:
 
     def shutdown(self):
         """shutdown the thread pool."""
+        self.tasks = None
         logger.debug("shutdown thread pool.")
         for id, _ in enumerate(self.pool):
             self.kill_worker_thread(id)
         self.pool.clear()
-        self.tasks = Queue()
-        logger.debug("shutdown water thread.")
-        self.kill_worker_thread(self.water_thread.ident)
         logger.debug("thread pool shutdown done.")
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(message)s")
 
-    pool = ThreadPool(num_workers=3, timeout=0 , enable_shutdown=True, name_prefix="test")
+    pool = ThreadPool(num_workers=3, timeout=0, enable_shutdown=True, name_prefix="test")
 
     def sleep_and_print(t):
         time.sleep(t)
@@ -193,6 +193,8 @@ if __name__ == "__main__":
     pool.submit(sleep_and_print, "sleep_and_print", 1, 3)
     pool.submit(sleep_and_print, "sleep_and_print", 2, 3)
     pool.submit(sleep_and_print, "sleep_and_print", 3, 3)
+    pool.shutdown()
     pool.submit(sleep_and_print, "sleep_and_print", 4, 3)
-    while True:
+    while not pool.empty:
         ...
+    logger.info("all done.")
